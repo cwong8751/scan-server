@@ -83,15 +83,42 @@ app.get('/clothing-items/:id', async (req, res) => {
 // Body: { type, color, image_url }
 app.post('/clothing-items', async (req, res) => {
   try {
-    const { type, color, image_url } = req.body;
-    const result = await pool.query(`
-      INSERT INTO inventory_schema.clothing_items (type, color, image_url)
-      VALUES ($1, $2, $3)
-      RETURNING *
-    `, [type, color, image_url]);
-    res.status(201).json(result.rows[0]);
+
+    // todo: remember to put image url when upload is ready 
+    const { type, color, size, barcode } = req.body;
+
+    // Insert clothing item
+    const itemResult = await pool.query(
+      `INSERT INTO inventory_schema.clothing_items (type, color, image_url)
+       VALUES ($1, $2, NULL)
+       RETURNING *`,
+      [type, color]
+    );
+
+    const item = itemResult.rows[0];
+
+    // Insert variant
+    const variantResult = await pool.query(
+      `INSERT INTO inventory_schema.clothing_variants
+       (clothing_item_id, size, barcode)
+       VALUES ($1, $2, $3)
+       RETURNING id, size, barcode`,
+      [item.id, size, barcode]
+    );
+
+    res.json({
+      ...item,
+      variants: [
+        {
+          variant_id: variantResult.rows[0].id,
+          size: variantResult.rows[0].size,
+          barcode: variantResult.rows[0].barcode
+        }
+      ]
+    });
+
   } catch (err) {
-    console.error(err.message);
+    console.error(err);
     res.status(500).json({ error: 'Database error' });
   }
 });
