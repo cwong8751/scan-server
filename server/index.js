@@ -1,12 +1,33 @@
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Create a pool
+// Serve uploaded images statically
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Multer setup — saves image to /uploads, only if provided
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    // Name the file after the prefix, e.g. ABC.jpg
+    const prefix = (req.body.barcode || '').slice(0, 3).toUpperCase();
+    const ext = path.extname(file.originalname);
+    cb(null, `${prefix}${ext}`);
+  }
+});
+const upload = multer({ storage });
+
 const pool = new Pool({
   host: 'localhost',
   port: 5432,
@@ -15,7 +36,6 @@ const pool = new Pool({
   password: '12345',
 });
 
-// Test the connection
 pool.connect((err, client, release) => {
   if (err) {
     console.error('Error connecting to the database:', err.message);
@@ -25,215 +45,235 @@ pool.connect((err, client, release) => {
   }
 });
 
-// ─── CLOTHING ITEMS ───────────────────────────────────────────────────────────
+// ─── HELPER ───────────────────────────────────────────────────────────────────
 
-// GET all clothing items (with their variants)
-app.get('/clothing-items', async (req, res) => {
+function parseBarcode(barcode) {
+  // e.g. ABCDM28 or ABCDXL05
+  if (!barcode || barcode.length < 7) throw new Error('Barcode too short');
+  if (barcode[3] !== 'D') throw new Error('4th character must be D');
+
+  const prefix      = barcode.slice(0, 3).toUpperCase();
+  const type_code   = barcode[0].toUpperCase();
+  const style_code  = barcode[1].toUpperCase();
+  const texture_code= barcode[2].toUpperCase();
+  const afterMarker = barcode.slice(4);                      // e.g. 'M28' or 'XL05'
+  const unit_number = parseInt(afterMarker.slice(-2), 10);   // last 2 chars
+  const size        = afterMarker.slice(0, -2).toUpperCase();// everything before last 2
+
+  if (!size) throw new Error('Could not parse size from barcode');
+  if (isNaN(unit_number)) throw new Error('Could not parse unit number from barcode');
+
+  return { prefix, type_code, style_code, texture_code, size, unit_number };
+}
+
+// ─── CHECK PREFIX ─────────────────────────────────────────────────────────────
+
+// GET /prefix-check/:prefix
+// Returns { exists: true/false } so the frontend knows whether to show image upload
+app.get('/prefix-check/:prefix', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        c.id, c.type, c.color, c.image_url, c.created_at,
-        JSON_AGG(
-          JSON_BUILD_OBJECT(
-            'variant_id', v.id,
-            'size', v.size,
-            'barcode', v.barcode
-          )
-        ) FILTER (WHERE v.id IS NOT NULL) AS variants
-      FROM inventory_schema.clothing_items c
-      LEFT JOIN inventory_schema.clothing_variants v ON v.clothing_item_id = c.id
-      GROUP BY c.id
-    `);
-    res.json(result.rows);
+    const prefix = req.params.prefix.toUpperCase();
+    const result = await pool.query(
+      `SELECT prefix FROM inventory_schema.clothing_images WHERE prefix = $1`,
+      [prefix]
+    );
+    res.json({ exists: result.rows.length > 0 });
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-// GET a single clothing item by ID (with its variants)
-app.get('/clothing-items/:id', async (req, res) => {
+// ─── SCAN / ADD ITEM ──────────────────────────────────────────────────────────
+
+// POST /scan
+// multipart/form-data: { barcode: string, image?: file }
+// - If prefix is new: image is required → inserts into clothing_images + clothing_items
+// - If prefix exists: image ignored   → inserts into clothing_items only
+app.post('/scan', upload.single('image'), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { id } = req.params;
-    const result = await pool.query(`
-      SELECT 
-        c.id, c.type, c.color, c.image_url, c.created_at,
-        JSON_AGG(
-          JSON_BUILD_OBJECT(
-            'variant_id', v.id,
-            'size', v.size,
-            'barcode', v.barcode
-          )
-        ) FILTER (WHERE v.id IS NOT NULL) AS variants
-      FROM inventory_schema.clothing_items c
-      LEFT JOIN inventory_schema.clothing_variants v ON v.clothing_item_id = c.id
-      WHERE c.id = $1
-      GROUP BY c.id
-    `, [id]);
+    const { barcode } = req.body;
+    if (!barcode) return res.status(400).json({ error: 'Barcode is required' });
 
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
+    const parsed = parseBarcode(barcode.toUpperCase());
 
-// POST create a new clothing item
-// Body: { type, color, image_url }
-app.post('/clothing-items', async (req, res) => {
-  try {
+    await client.query('BEGIN');
 
-    // todo: remember to put image url when upload is ready 
-    const { type, color, size, barcode } = req.body;
+    // Check if prefix already exists
+    const prefixCheck = await client.query(
+      `SELECT prefix, image_url FROM inventory_schema.clothing_images WHERE prefix = $1`,
+      [parsed.prefix]
+    );
 
-    // Insert clothing item
-    const itemResult = await pool.query(
-      `INSERT INTO inventory_schema.clothing_items (type, color, image_url)
-       VALUES ($1, $2, NULL)
+    let image_url;
+
+    if (prefixCheck.rows.length === 0) {
+      // First scan for this prefix — image is required
+      if (!req.file) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: 'This is a new clothing prefix. An image is required for the first scan.'
+        });
+      }
+      image_url = `/uploads/${req.file.filename}`;
+      await client.query(
+        `INSERT INTO inventory_schema.clothing_images (prefix, image_url) VALUES ($1, $2)`,
+        [parsed.prefix, image_url]
+      );
+    } else {
+      // Prefix exists — use existing image, ignore any uploaded file
+      image_url = prefixCheck.rows[0].image_url;
+    }
+
+    // Check barcode isn't already registered
+    const barcodeCheck = await client.query(
+      `SELECT id FROM inventory_schema.clothing_items WHERE barcode = $1`,
+      [barcode.toUpperCase()]
+    );
+    if (barcodeCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This barcode has already been scanned' });
+    }
+
+    // Insert the unit — trigger auto-fills parsed columns
+    const result = await client.query(
+      `INSERT INTO inventory_schema.clothing_items (barcode, image_prefix, type_code, style_code, texture_code, size, unit_number)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [type, color]
-    );
-
-    const item = itemResult.rows[0];
-
-    // Insert variant
-    const variantResult = await pool.query(
-      `INSERT INTO inventory_schema.clothing_variants
-       (clothing_item_id, size, barcode)
-       VALUES ($1, $2, $3)
-       RETURNING id, size, barcode`,
-      [item.id, size, barcode]
-    );
-
-    res.json({
-      ...item,
-      variants: [
-        {
-          variant_id: variantResult.rows[0].id,
-          size: variantResult.rows[0].size,
-          barcode: variantResult.rows[0].barcode
-        }
+      [
+        barcode.toUpperCase(),
+        parsed.prefix,
+        parsed.type_code,
+        parsed.style_code,
+        parsed.texture_code,
+        parsed.size,
+        parsed.unit_number
       ]
+    );
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      ...result.rows[0],
+      image_url
     });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Database error' });
+    await client.query('ROLLBACK');
+    console.error(err.message);
+    res.status(400).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
-// PUT update a clothing item by ID
-// Body: { type, color, image_url }
-app.put('/clothing-items/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { type, color, image_url } = req.body;
-    const result = await pool.query(`
-      UPDATE inventory_schema.clothing_items
-      SET type = $1, color = $2, image_url = $3
-      WHERE id = $4
-      RETURNING *
-    `, [type, color, image_url, id]);
+// ─── GET ALL ITEMS ────────────────────────────────────────────────────────────
 
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    res.json(result.rows[0]);
+// GET /clothing-items
+// Returns items grouped by prefix. Each group has:
+//   prefix, image_url, type_code, style_code, texture_code,
+//   sizes: [{ size, count, units: [{ id, barcode, unit_number }] }]
+app.get('/clothing-items', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        ci.image_prefix   AS prefix,
+        img.image_url,
+        ci.type_code,
+        ci.style_code,
+        ci.texture_code,
+        ci.size,
+        COUNT(*)::int      AS count,
+        JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'id',          ci.id,
+            'barcode',     ci.barcode,
+            'unit_number', ci.unit_number,
+            'created_at',  ci.created_at
+          ) ORDER BY ci.unit_number
+        ) AS units
+      FROM inventory_schema.clothing_items ci
+      JOIN inventory_schema.clothing_images img ON img.prefix = ci.image_prefix
+      GROUP BY ci.image_prefix, img.image_url, ci.type_code, ci.style_code, ci.texture_code, ci.size
+      ORDER BY ci.image_prefix, ci.size
+    `);
+
+    // Re-group by prefix on the JS side so the frontend gets one object per clothing
+    const grouped = {};
+    for (const row of result.rows) {
+      if (!grouped[row.prefix]) {
+        grouped[row.prefix] = {
+          prefix:       row.prefix,
+          image_url:    row.image_url,
+          type_code:    row.type_code,
+          style_code:   row.style_code,
+          texture_code: row.texture_code,
+          sizes: []
+        };
+      }
+      grouped[row.prefix].sizes.push({
+        size:  row.size,
+        count: row.count,
+        units: row.units
+      });
+    }
+
+    res.json(Object.values(grouped));
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-// DELETE a clothing item by ID (cascades to variants automatically)
+// ─── DELETE A SINGLE UNIT ─────────────────────────────────────────────────────
+
+// DELETE /clothing-items/:id
+// Deletes one physical unit by its row id.
+// If it was the last unit under a prefix, also deletes the clothing_images row.
 app.delete('/clothing-items/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
-    const result = await pool.query(`
-      DELETE FROM inventory_schema.clothing_items WHERE id = $1 RETURNING *
-    `, [id]);
+    await client.query('BEGIN');
 
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    res.json({ message: 'Deleted successfully', item: result.rows[0] });
+    // Get the item first so we know its prefix
+    const itemResult = await client.query(
+      `DELETE FROM inventory_schema.clothing_items WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    if (itemResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    const deletedItem = itemResult.rows[0];
+
+    // Check if any units remain under this prefix
+    const remaining = await client.query(
+      `SELECT COUNT(*) FROM inventory_schema.clothing_items WHERE image_prefix = $1`,
+      [deletedItem.image_prefix]
+    );
+
+    if (parseInt(remaining.rows[0].count, 10) === 0) {
+      // No units left — clean up the image row too
+      await client.query(
+        `DELETE FROM inventory_schema.clothing_images WHERE prefix = $1`,
+        [deletedItem.image_prefix]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: 'Deleted successfully', item: deletedItem });
+
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error(err.message);
     res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// ─── CLOTHING VARIANTS ────────────────────────────────────────────────────────
-
-// GET all variants for a clothing item
-app.get('/clothing-items/:id/variants', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query(`
-      SELECT * FROM inventory_schema.clothing_variants WHERE clothing_item_id = $1
-    `, [id]);
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// POST add a variant to a clothing item
-// Body: { size, barcode }
-app.post('/clothing-items/:id/variants', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { size, barcode } = req.body;
-    const result = await pool.query(`
-      INSERT INTO inventory_schema.clothing_variants (clothing_item_id, size, barcode)
-      VALUES ($1, $2, $3)
-      RETURNING *
-    `, [id, size, barcode]);
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'Barcode already exists' });
-    console.error(err.message);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// PUT update a variant by variant ID
-// Body: { size, barcode }
-app.put('/variants/:variantId', async (req, res) => {
-  try {
-    const { variantId } = req.params;
-    const { size, barcode } = req.body;
-    const result = await pool.query(`
-      UPDATE inventory_schema.clothing_variants
-      SET size = $1, barcode = $2
-      WHERE id = $3
-      RETURNING *
-    `, [size, barcode, variantId]);
-
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Variant not found' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'Barcode already exists' });
-    console.error(err.message);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// DELETE a variant by variant ID
-app.delete('/variants/:variantId', async (req, res) => {
-  try {
-    const { variantId } = req.params;
-    const result = await pool.query(`
-      DELETE FROM inventory_schema.clothing_variants WHERE id = $1 RETURNING *
-    `, [variantId]);
-
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Variant not found' });
-    res.json({ message: 'Deleted successfully', variant: result.rows[0] });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: 'Database error' });
+  } finally {
+    client.release();
   }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`App listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`App listening on port ${PORT}`));
